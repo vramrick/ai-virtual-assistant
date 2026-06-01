@@ -152,6 +152,11 @@ class LLMConfig(ConfigWizard):
         default="ai-mixtral-8x7b-instruct",
         help_txt="The name of the ai catalog model to be used with PandasAI agent",
     )
+    max_retries: int = configfield(
+        "max_retries",
+        default=3,
+        help_txt="Maximum attempts per LLM call before surfacing failure. Uses exponential backoff with jitter. Set to 1 to disable retries; useful primarily when the hosted endpoint rate-limits (HTTP 429).",
+    )
 
 @configclass
 class TextSplitterConfig(ConfigWizard):

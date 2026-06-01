@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- `APP_LLM_MAX_RETRIES` setting (default `3`). Controls how many times an LLM call retries on HTTP 429 or 5xx errors before surfacing the failure. Set to `1` on self-hosted endpoints where retries are unnecessary.
+
+### Changed
+- LLM calls retry transient endpoint failures (HTTP 429 / 5xx) with exponential backoff and jitter.
+- The agent surfaces a rate-limit-specific message ("The model service is rate-limited right now. Please try again in a moment.") when the upstream LLM is throttled, alongside the existing generic rephrase fallbacks for other failure modes.
+
 ## [1.1.0] - 2024-12-12
 
 ### Added

@@ -10,6 +10,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Changed
 - LLM calls retry transient endpoint failures (HTTP 429 / 5xx) with exponential backoff and jitter.
 - The agent surfaces a rate-limit-specific message ("The model service is rate-limited right now. Please try again in a moment.") when the upstream LLM is throttled, alongside the existing generic rephrase fallbacks for other failure modes.
+- `get_product_name` and the unstructured retriever's query-rewriting step fall back to deterministic logic when their structured-output LLM call fails or returns no usable response. `get_product_name` falls back to token-overlap substring matching against the supplied product list; query rewriting falls back to the original user query unchanged. Retrieval continues either way.
 
 ## [1.1.0] - 2024-12-12
 

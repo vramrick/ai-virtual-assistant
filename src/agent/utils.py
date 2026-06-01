@@ -43,56 +43,69 @@ default_llm_kwargs = {"temperature": 0, "top_p": 0.7, "max_tokens": 1024}
 canonical_rag_url = os.getenv('CANONICAL_RAG_URL', 'http://unstructured-retriever:8081')
 canonical_rag_search = f"{canonical_rag_url}/search"
 
+def _match_product_from_text(text: str, product_list) -> str:
+    """Deterministic substring match used as the robustness fallback when LLM extraction
+    is unavailable (rate-limit) or unreliable (model can't drive structured output).
+    Returns '' when no product's tokens match the text."""
+    if not text or not product_list:
+        return ''
+    text_lower = text.lower()
+    best, best_hits = '', 0
+    for product in product_list:
+        tokens = [t for t in re.split(r'\s+', product.lower()) if len(t) > 2 and t != 'nvidia']
+        if not tokens:
+            continue
+        hits = sum(1 for t in tokens if t in text_lower)
+        if hits > best_hits or (hits == best_hits and hits > 0 and len(product) > len(best)):
+            best, best_hits = product, hits
+    return best if best_hits > 0 else ''
+
+
 def get_product_name(messages, product_list) -> Dict:
-    """Given the user message and list of product find list of items which user might be talking about"""
+    """Given the user message and list of product find list of items which user might be talking about.
 
-    # First check product name in query
-    # If it's not in query, check in conversation
-    # Once the product name is known we will search for product name from database
-    # We will return product name from list and actual name detected.
-
-    llm = get_llm(**default_llm_kwargs)
+    Tries LLM-based structured extraction first; falls back to a deterministic substring
+    match against product_list so the agent stays functional when the LLM is rate-limited
+    or the model can't reliably emit structured output. Happy-path behavior is unchanged.
+    """
 
     class Product(BaseModel):
         name: str = Field(..., description="Name of the product talked about.")
 
-    prompt_text = prompts.get("get_product_name")["base_prompt"]
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", prompt_text),
-        ]
-    )
-    llm = llm.with_structured_output(Product)
+    last_human_message = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), None) or ""
+    product_name = None
 
-    chain = prompt | llm
-    # query to be used for document retrieval
-    # Get the last human message instead of messages[-2]
-    last_human_message = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), None)
-    response = chain.invoke({"query": last_human_message})
+    # Happy path 1: LLM extracts the product name from the latest user message.
+    try:
+        prompt_text = prompts.get("get_product_name")["base_prompt"]
+        prompt = ChatPromptTemplate.from_messages([("system", prompt_text)])
+        llm = get_llm(**default_llm_kwargs).with_structured_output(Product)
+        response = (prompt | llm).invoke({"query": last_human_message})
+        if response is not None and getattr(response, "name", None) not in (None, "null"):
+            product_name = response.name
+    except Exception as exc:
+        logger.warning("LLM product extraction (query) failed; will try conversation/substring fallback: %s", exc)
 
-    product_name = response.name
+    # Happy path 2: LLM tries again over the full conversation when the first call yielded nothing.
+    if not product_name:
+        try:
+            fallback_prompt_text = prompts.get("get_product_name")["fallback_prompt"]
+            prompt = ChatPromptTemplate.from_messages([("system", fallback_prompt_text)])
+            llm = get_llm(**default_llm_kwargs).with_structured_output(Product)
+            response = (prompt | llm).invoke({"messages": messages})
+            if response is not None and getattr(response, "name", None) not in (None, "null"):
+                product_name = response.name
+        except Exception as exc:
+            logger.warning("LLM product extraction (conversation) failed; will try substring fallback: %s", exc)
 
-    # Check if product name is in query
-    if product_name == 'null':
+    # Robustness fallback: deterministic substring match against the known product list.
+    # Reached when both LLM calls were rate-limited, errored, or returned no usable name.
+    if not product_name:
+        product_name = _match_product_from_text(last_human_message, product_list)
+        if product_name:
+            logger.info("Substring-matched product from query text: %s", product_name)
 
-        # Check for produt name in user conversation
-        fallback_prompt_text = prompts.get("get_product_name")["fallback_prompt"]
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", fallback_prompt_text),
-            ]
-        )
-
-        llm = get_llm(**default_llm_kwargs)
-        llm = llm.with_structured_output(Product)
-
-        chain = prompt | llm
-        # query to be used for document retrieval
-        response = chain.invoke({"messages": messages})
-
-        product_name = response.name
-    # Check if it's partial name exists or not
-    if product_name == 'null':
+    if not product_name:
         return {}
 
     def filter_products_by_name(name, products):

@@ -113,26 +113,32 @@ class UnstructuredRetriever(BaseExample):
             logger.info(f"Setting top k as: {top_k}.")
             retriever = vs.as_retriever(search_kwargs={"k": top_k}) # milvus does not support similarily threshold
 
-            # Invoke query rewriting to decontextualize the query before sending to retriever pipeline if conv history is passed
+            # Invoke query rewriting to decontextualize the query before sending to retriever pipeline if conv history is passed.
+            # Falls back to the original `content` (the latest user query) if the LLM is rate-limited or returns no structured output;
+            # retrieval still proceeds, just without conversational decontextualization.
             if conv_history:
                 class Question(BaseModel):
                     question: str = Field(..., description="A standalone question which can be understood without the chat history")
 
                 parsed_conv_history = [(msg.get("role"), msg.get("content")) for msg in conv_history]
                 default_llm_kwargs = {"temperature": 0.2, "top_p": 0.7, "max_tokens": 1024}
-                llm = get_llm(**default_llm_kwargs)
-                llm = llm.with_structured_output(Question)
-                query_rewriter_prompt = prompts.get("query_rewriting")
-                contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                    [("system", query_rewriter_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}"),]
-                )
-                q_prompt = contextualize_q_prompt | llm 
-                logger.info(f"Query rewriter prompt: {contextualize_q_prompt}")
-                response = q_prompt.invoke({"input": content, "chat_history": parsed_conv_history})
-                content = response.question
-                logger.info(f"Rewritten Query: {content}")
-                if content.replace('"', "'") == "''" or len(content) == 0:
-                    return []
+                try:
+                    llm = get_llm(**default_llm_kwargs).with_structured_output(Question)
+                    query_rewriter_prompt = prompts.get("query_rewriting")
+                    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+                        [("system", query_rewriter_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}"),]
+                    )
+                    q_prompt = contextualize_q_prompt | llm
+                    logger.info(f"Query rewriter prompt: {contextualize_q_prompt}")
+                    response = q_prompt.invoke({"input": content, "chat_history": parsed_conv_history})
+                    rewritten = getattr(response, "question", None) if response is not None else None
+                    if rewritten and len(rewritten.strip()) > 0 and rewritten.replace('"', "'") != "''":
+                        content = rewritten
+                        logger.info(f"Rewritten Query: {content}")
+                    else:
+                        logger.info("Query rewriter returned empty result; falling back to original query.")
+                except Exception as exc:
+                    logger.warning("LLM query rewriting failed; falling back to original query unchanged: %s", exc)
 
             if ranker:
                 logger.info(f"Narrowing the collection from {top_k} results and further narrowing it to {num_docs} with the reranker for rag chain.")

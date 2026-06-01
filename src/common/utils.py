@@ -45,6 +45,72 @@ except Exception as e:
     logger.error(f"Optional langchain API Catalog connector langchain_nvidia_ai_endpoints not installed.")
 
 try:
+    from tenacity import (
+        before_sleep_log,
+        retry,
+        retry_if_exception,
+        stop_after_attempt,
+        wait_exponential_jitter,
+    )
+except Exception:
+    logger.warning("tenacity not installed; LLM retry on transient errors will be disabled.")
+    retry = None  # type: ignore[assignment]
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """Return True for errors that should be retried.
+
+    langchain_nvidia_ai_endpoints raises a bare Exception whose message embeds
+    the HTTP status. Until upstream exposes a typed exception, we match on the
+    rendered message. We retry HTTP 429 (rate limit) and 5xx (transient server
+    errors); other errors (auth, validation) bubble up immediately.
+    """
+    msg = str(exc)
+    return any(
+        token in msg
+        for token in ("429", "Too Many Requests", "500", "502", "503", "504")
+    )
+
+
+# Read once at import time; respected at decorator-evaluation time. Default 3.
+_LLM_MAX_RETRIES = max(1, int(os.getenv("APP_LLM_MAX_RETRIES", "3")))
+
+
+if "ChatNVIDIA" in globals() and retry is not None:
+
+    class _RetryingChatNVIDIA(ChatNVIDIA):
+        """ChatNVIDIA that retries transient endpoint failures at the generate layer.
+
+        Decorating ``_generate`` / ``_agenerate`` ensures the retry survives
+        ``.bind_tools()`` and ``.with_structured_output()``, which strip
+        ``Runnable.with_retry()`` wrappers via attribute delegation. Retries
+        each model call individually so tool-calling agents don't compound
+        wait time across many graph steps.
+        """
+
+        @retry(
+            retry=retry_if_exception(_is_transient_llm_error),
+            stop=stop_after_attempt(_LLM_MAX_RETRIES),
+            wait=wait_exponential_jitter(initial=1, max=15),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+        def _generate(self, *args, **kwargs):
+            return super()._generate(*args, **kwargs)
+
+        @retry(
+            retry=retry_if_exception(_is_transient_llm_error),
+            stop=stop_after_attempt(_LLM_MAX_RETRIES),
+            wait=wait_exponential_jitter(initial=1, max=15),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+        async def _agenerate(self, *args, **kwargs):
+            return await super()._agenerate(*args, **kwargs)
+else:
+    _RetryingChatNVIDIA = ChatNVIDIA if "ChatNVIDIA" in globals() else None  # type: ignore[misc]
+
+try:
     from langchain_community.vectorstores import PGVector
     from langchain_community.vectorstores import Milvus
     from langchain_community.docstore.in_memory import InMemoryDocstore
@@ -175,16 +241,19 @@ def get_llm(**kwargs) -> LLM | SimpleChatModel:
         unused_params = [key for key in kwargs.keys() if key not in ['temperature', 'top_p', 'max_tokens']]
         if unused_params:
             logger.warning(f"The following parameters from kwargs are not supported: {unused_params} for {settings.llm.model_engine}")
+        # Retry transient endpoint failures (HTTP 429 / 5xx) at the _generate layer
+        # via _RetryingChatNVIDIA. Subclassing keeps the retry policy in effect after
+        # .bind_tools() / .with_structured_output(), which strip Runnable.with_retry().
         if settings.llm.server_url:
             logger.info(f"Using llm model {settings.llm.model_name} hosted at {settings.llm.server_url}")
-            return ChatNVIDIA(base_url=f"http://{settings.llm.server_url}/v1",
+            return _RetryingChatNVIDIA(base_url=f"http://{settings.llm.server_url}/v1",
                             model=settings.llm.model_name,
                             temperature = kwargs.get('temperature', None),
                             top_p = kwargs.get('top_p', None),
                             max_tokens = kwargs.get('max_tokens', None))
         else:
             logger.info(f"Using llm model {settings.llm.model_name} from api catalog")
-            return ChatNVIDIA(model=settings.llm.model_name,
+            return _RetryingChatNVIDIA(model=settings.llm.model_name,
                             temperature = kwargs.get('temperature', None),
                             top_p = kwargs.get('top_p', None),
                             max_tokens = kwargs.get('max_tokens', None))

@@ -87,6 +87,21 @@ FALLBACK_RESPONSES = [
     "Oops, that proved a tad difficult for me, can you retry with another question?"
 ]
 
+# Distinct fallback for rate-limit errors so users know to retry rather than rephrase.
+RATE_LIMIT_FALLBACK = (
+    "The model service is rate-limited right now. Please try again in a moment."
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Heuristic match for HTTP 429 surfaced by langchain_nvidia_ai_endpoints.
+
+    Upstream raises a bare Exception whose message includes the status code, so we
+    inspect the rendered message. Replace with isinstance once a typed exception lands.
+    """
+    msg = str(exc)
+    return "429" in msg or "Too Many Requests" in msg
+
 class Message(BaseModel):
     """Definition of the Chat Message type."""
     role: str = Field(description="Role for a message AI, User and System", default="user", max_length=256, pattern=r'[\s\S]*')
@@ -390,6 +405,7 @@ async def generate_answer(request: Request,
             try:
                 resp_id = str(uuid4())
                 is_exception = False
+                is_rate_limited = False
                 # Variable to track if this is the first yield
                 is_first_yield = True
                 resp_str = ""
@@ -511,11 +527,13 @@ async def generate_answer(request: Request,
                 logger.error(f"Sending empty response. Unexpected error in response_generator: {e}")
                 print_exc()
                 is_exception = True
+                is_rate_limited = _is_rate_limit_error(e)
 
             if is_exception:
                 logger.error("Sending back fallback responses since an exception was raised.")
                 is_exception = False
-                for data in fallback_response_generator(sentence=random.choice(FALLBACK_RESPONSES), session_id=prompt.session_id):
+                fallback_sentence = RATE_LIMIT_FALLBACK if is_rate_limited else random.choice(FALLBACK_RESPONSES)
+                for data in fallback_response_generator(sentence=fallback_sentence, session_id=prompt.session_id):
                     yield data
 
             chain_response = ChainResponse()
